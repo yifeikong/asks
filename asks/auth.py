@@ -46,15 +46,17 @@ class BasicAuth(PreResponseAuth):
     '''
     Ye Olde Basic HTTP Auth.
     '''
-    def __init__(self, auth_info, encoding='utf-8'):
+    def __init__(self, auth_info, encoding='utf-8',
+                 header_name='Authorization'):
         self.auth_info = auth_info
         self.encoding = encoding
+        self.header_name = header_name
 
     async def __call__(self, _):
         usrname, psword = [bytes(x, self.encoding) for x in self.auth_info]
         encoded_auth = str(base64.b64encode(usrname + b':' + psword),
                            self.encoding)
-        return {'Authorization': 'Basic {}'.format(encoded_auth)}
+        return {self.header_name: 'Basic {}'.format(encoded_auth)}
 
 
 class DigestAuth(PostResponseAuth):
