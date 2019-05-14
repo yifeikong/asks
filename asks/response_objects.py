@@ -8,7 +8,7 @@ from async_generator import async_generator, yield_
 import h11
 
 from .http_utils import decompress, parse_content_encoding
-from .utils import timeout_manager
+from .utils import timeout_manager, recv_event
 from .errors import BadStatus
 
 
@@ -133,7 +133,8 @@ class StreamBody:
         if self.content_encoding is not None:
             decompressor = decompress(parse_content_encoding(self.content_encoding))
         while True:
-            event = await self._recv_event()
+            event = await recv_event(self.sock, self.h11_connection, timeout=self.timeout,
+                                     read_size=self.read_size)
             if isinstance(event, h11.Data):
                 if self.content_encoding is not None:
                     if self.decompress_data:
@@ -141,17 +142,6 @@ class StreamBody:
                 await yield_(event.data)
             elif isinstance(event, h11.EndOfMessage):
                 break
-
-    async def _recv_event(self):
-        while True:
-            event = self.h11_connection.next_event()
-
-            if event is h11.NEED_DATA:
-                data = await timeout_manager(self.timeout, self.sock.receive_some, self.read_size)
-                self.h11_connection.receive_data(data)
-                continue
-
-            return event
 
     def __call__(self, timeout=None):
         self.timeout = timeout

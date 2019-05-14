@@ -3,8 +3,8 @@
 import h11
 import pytest
 
-from asks.request_object import RequestProcessor
 
+from asks.request_object import RequestProcessor
 
 def _catch_response(monkeypatch, headers, data):
     req = RequestProcessor(None, 'get', "toot-toot", None)
@@ -13,9 +13,9 @@ def _catch_response(monkeypatch, headers, data):
         h11._events.Data(data=data),
         h11._events.EndOfMessage(),
     ]
-    async def _recv_event(hconn):
+    async def _recv_event(sock, hconn, timeout, read_size):
         return events.pop(0)
-    monkeypatch.setattr(req, '_recv_event', _recv_event)
+    monkeypatch.setattr('asks.request_object.recv_event', _recv_event)
     monkeypatch.setattr(req, 'host', 'lol')
     cr = req._catch_response(None)
     try:

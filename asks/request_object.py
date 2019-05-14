@@ -21,7 +21,7 @@ import re
 import h11
 from h11 import RemoteProtocolError
 
-from .utils import requote_uri
+from .utils import requote_uri, send_event, recv_event
 from .cookie_utils import parse_cookies
 from .auth import PreResponseAuth, PostResponseAuth
 from .req_structs import CaseInsensitiveDict as c_i_dict
@@ -249,7 +249,8 @@ class RequestProcessor:
             This function sets off a possible call to `_redirect` which
             is semi-recursive.
         '''
-        await self._send(h11_request, h11_body, h11_connection)
+
+        await send_event(self.sock, h11_request, h11_body, h11_connection)
         response_obj = await self._catch_response(h11_connection)
         parse_cookies(response_obj, self.host)
 
@@ -531,7 +532,9 @@ class RequestProcessor:
             The most recent response object.
         '''
 
-        response = await self._recv_event(h11_connection)
+        response = await recv_event(self.sock, h11_connection,
+                                    timeout=self.timeout,
+                                    read_size=10000)
 
         resp_data = {'encoding': self.encoding,
                      'method': self.method,
@@ -588,7 +591,9 @@ class RequestProcessor:
 
             else:
                 while True:
-                    data = await self._recv_event(h11_connection)
+                    data = await recv_event(self.sock, h11_connection,
+                                            timeout=self.timeout,
+                                            read_size=10000)
 
                     if isinstance(data, h11.Data):
                         resp_data['body'] += data.data
@@ -597,35 +602,15 @@ class RequestProcessor:
                         break
 
         else:
-            endof = await self._recv_event(h11_connection)
+            endof = await recv_event(self.sock, h11_connection,
+                                     timeout=self.timeout,
+                                     read_size=10000)
             assert isinstance(endof, h11.EndOfMessage)
 
         if self.streaming:
             return StreamResponse(**resp_data)
 
         return Response(**resp_data)
-
-    async def _recv_event(self, h11_connection):
-        while True:
-            event = h11_connection.next_event()
-            if event is h11.NEED_DATA:
-                h11_connection.receive_data(await self.sock.receive_some(10000))
-                continue
-            return event
-
-    async def _send(self, request_bytes, body_bytes, h11_connection):
-        '''
-        Takes a package and body, combines then, then shoots 'em off in to
-        the ether.
-
-        Args:
-            package (list of str): The header package.
-            body (str): The str representation of the body.
-        '''
-        await self.sock.send_all(h11_connection.send(request_bytes))
-        if body_bytes is not None:
-            await self.sock.send_all(h11_connection.send(body_bytes))
-        await self.sock.send_all(h11_connection.send(h11.EndOfMessage()))
 
     async def _auth_handler_pre(self):
         '''
@@ -714,7 +699,9 @@ class RequestProcessor:
         '''
         # pylint: disable=not-callable
         while True:
-            next_event = await self._recv_event(h11_connection)
+            next_event = await recv_event(self.sock, h11_connection,
+                                          timeout=self.timeout,
+                                          read_size=10000)
             if isinstance(next_event, h11.Data):
                 await self.callback(next_event.data)
             else:

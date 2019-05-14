@@ -1,7 +1,9 @@
-__all__ = ['get_netloc_port', 'requote_uri', 'timeout_manager']
+__all__ = ['get_netloc_port', 'requote_uri', 'timeout_manager', 'send_event',
+           'recv_event']
 
 
-from urllib.parse import  quote
+import h11
+from urllib.parse import quote
 from functools import wraps
 
 from anyio import fail_after
@@ -85,3 +87,40 @@ def processor(gen):
         next(g)
         return g
     return wrapper
+
+
+async def send_event(sock, request_bytes, body_bytes, h11_connection):
+    '''
+    Takes a h11 request, body and connection, then shoots 'em off
+    in to the ether.
+
+    Args:
+        sock (socket): the socket to be used for sending bytes.
+        h11_req (h11.Request): the h11 request object.
+        h11_body (h11.Data): the h11 request body object.
+        hconnection (h11.Connection): the h11 connection object.
+    '''
+    await sock.send_all(h11_connection.send(request_bytes))
+    if body_bytes is not None:
+        await sock.send_all(h11_connection.send(body_bytes))
+    await sock.send_all(h11_connection.send(h11.EndOfMessage()))
+
+
+async def recv_event(sock, h11_connection, *, timeout=30, read_size=10000):
+    '''
+    Receive h11 event from given sock, and give back h11 response when we have
+    enough data.
+
+    Args:
+        sock (socket): the socket to be used for receiving bytes.
+        hconnection (h11.Connection): the h11 connection object.
+        timeout (int or float): seconds before timeout.
+        read_size (int or float): read size for each read call.
+    '''
+    while True:
+        event = h11_connection.next_event()
+        if event is h11.NEED_DATA:
+            data = await timeout_manager(timeout, sock.receive_some, read_size)
+            h11_connection.receive_data(data)
+            continue
+        return event
