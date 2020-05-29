@@ -80,6 +80,8 @@ class RequestProcessor:
 
         sock (StreamSock): The socket object to be used for the request. This
             socket object may be updated on `connection: close` headers.
+
+        proxy (str): Proxy address to be used for the request.
     '''
     def __init__(self, session, method, uri, port, **kwargs):
         # These are kwargsable attribs.
@@ -103,6 +105,7 @@ class RequestProcessor:
         self.sock = None
         self.persist_cookies = None
         self.mimetype = None
+        self.proxy = None
 
         # IS THIS SUCH A SIN? Maybe. Hacky at best but hey.
         # All of the above instance vars are valid args/kwargs.
@@ -191,6 +194,10 @@ class RequestProcessor:
             asks_headers.update(await self._auth_handler_pre())
             asks_headers.update(await self._auth_handler_post_get_auth())
 
+        # add proxy auth
+        if self.proxy.auth is not None:
+
+
         # add cookies
         if self.cookies:
             cookie_str = ''
@@ -208,8 +215,12 @@ class RequestProcessor:
             req_body = None
 
         # Construct h11 request object.
+        if self.scheme == 'http' and self.proxy:
+            path = urlunparse((self.scheme, self.netloc, self.path, '', '', ''))
+        else:
+            path = self.path
         req = h11.Request(method=self.method,
-                          target=self.path,
+                          target=path,
                           headers=asks_headers.items())
 
         # call i/o handling func
@@ -380,7 +391,7 @@ class RequestProcessor:
         the current connection and requesting a new one.
         '''
         self.sock._active = False
-        self.sock = await self.session._grab_connection(self.uri)
+        self.sock = await self.session._grab_connection(self.uri, self.proxy)
         self.port = self.sock.port
 
     async def _formulate_body(self):

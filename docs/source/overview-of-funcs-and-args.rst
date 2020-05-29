@@ -223,6 +223,15 @@ The streaming body can also be used for streaming feeds and stuff of twitter and
 
 For some examples of how to use this, `look here <https://asks.readthedocs.io/en/latest/idioms.html#handling-response-body-content-downloads-etc>`_
 
+Using Http(s) Proxies
+---------------------
+
+You could use proxy by add the ``proxy`` argument. Note that this argument override the ``proxy`` argument is session.
+
+    async def example():
+        urls = ['http://www.example.com', 'https://www.httpbin.org']
+        for url in urls:
+            await asks.get(url, proxy='http://user:pass@localhost:3128')
 
 Callbacks
 _________

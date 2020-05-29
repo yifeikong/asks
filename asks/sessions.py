@@ -8,14 +8,16 @@ from functools import partialmethod
 from urllib.parse import urlparse, urlunparse
 import ssl
 
+import h11
 from h11 import RemoteProtocolError
 from anyio import connect_tcp, create_semaphore
 
 from .cookie_utils import CookieTracker
-from .errors import BadHttpResponse
+from .errors import BadHttpResponse, RequestTimeout, ProxyError
 from .req_structs import SocketQ
 from .request_object import RequestProcessor
-from .utils import get_netloc_port, timeout_manager
+from .utils import get_netloc_port, timeout_manager, send_event, recv_event
+from .proxy import Proxy
 
 __all__ = ['Session']
 
@@ -24,16 +26,18 @@ class BaseSession(metaclass=ABCMeta):
     '''
     The base class for asks' sessions.
     Contains methods for creating sockets, figuring out which type of
-    socket to create, and all of the HTTP methods ('GET', 'POST', etc.)
+    socket to create, connecting the proxy, and all of the HTTP
+    methods ('GET', 'POST', etc.)
     '''
 
-    def __init__(self, headers=None, ssl_context=None):
+    def __init__(self, headers=None, ssl_context=None, proxy=None):
         '''
         Args:
             headers (dict): Headers to be applied to all requests.
                 headers set by http method call will take precedence and
                 overwrite headers set by the headers arg.
             ssl_context (ssl.SSLContext): SSL context to use for https connections.
+            proxy (str): proxy address to use for all requests.
         '''
         if headers is not None:
             self.headers = headers
@@ -41,6 +45,7 @@ class BaseSession(metaclass=ABCMeta):
             self.headers = {}
 
         self.ssl_context = ssl_context
+        self.proxy = Proxy.parse(proxy)
         self.encoding = None
         self.source_address = None
         self._cookie_tracker = None
@@ -79,25 +84,72 @@ class BaseSession(metaclass=ABCMeta):
         sock._active = True
         return sock
 
-    async def _connect(self, host_loc):
+    async def _prepare_https_proxy(self, sock, address):
+        '''
+        To use https-tunnelling http proxies, we first ``CONNECT`` the proxy
+        server, the server should open a SSL tunnel for us.
+
+            CONNECT httpbin.org:443 HTTP/1.1
+            Host: httpbin.org:443
+
+        Then we must do TLS handshake and so on, to do this we must
+        wrap raw socket into a secure one.
+
+        Args:
+            sock (SockeStream) raw socket to proxy server
+            address (tuple(str, int)) remote server address, not proxy
+        '''
+        host = '{}:{}'.format(address[0], address[1])
+        connect_req = h11.Request(method='CONNECT',
+                                  target=host,
+                                  headers=[('Host', host),
+                                           ('Proxy-Connection', 'Keep-Alive')])
+        hconnection = h11.Connection(our_role=h11.CLIENT)
+        await send_event(sock, connect_req, None, hconnection)
+        try:
+            rsp = await recv_event(sock, hconnection)
+            if rsp.status_code == 200:
+                # server_name is crucial here, it means we handshake
+                # with remote server, not the proxy
+                sock._server_hostname = address[0]
+                sock = await sock.start_tls()
+                sock._active = True
+                return sock
+            else:
+                raise ProxyError('status code {}, message {}'
+                                 .format(rsp.status_code, rsp.message))
+        except RemoteProtocolError as e:
+            raise ProxyError('Can not connect to proxy server') from e
+
+    async def _connect(self, scheme, address, proxy):
         '''
         Simple enough stuff to figure out where we should connect, and creates
         the appropriate connection.
         '''
-        scheme, host, path, parameters, query, fragment = urlparse(
-            host_loc)
-        if parameters or query or fragment:
-            raise ValueError('Supplied info beyond scheme, host.' +
-                             ' Host should be top level only: ', path)
-
-        host, port = get_netloc_port(scheme, host)
-
-        if scheme == 'http':
-            return await self._open_connection_http(
-                (host, int(port))), port
-        else:
-            return await self._open_connection_https(
-                (host, int(port))), port
+        if proxy:
+            # always connect the proxy without tls
+            sock = await self._open_connection_http(proxy.address)
+            # If we are visiting a https url, start a tunnel via the proxy.
+            # First open a http(non-SSL) connection to proxy server
+            # for `CONNECT` method, which instructs the proxy server to open
+            # a SSL tunnel for us
+            if scheme == 'https':
+                sock = await self._prepare_https_proxy(sock, address)
+                # the tunnel is bound to both the proxy and remote host
+                sock.host = (address, proxy.address)
+                sock.proxy_type = 'https'
+            else:
+                # any other connection to this proxy could reuse the same socket
+                sock.host = proxy.address
+                sock.proxy_type = 'http'
+        else:  # https
+            if scheme == 'https':
+                sock = await self._open_connection_https(address)
+            else:
+                sock = await self._open_connection_http(address)
+            sock.host = address
+            sock.proxy_type = None
+        return sock
 
     async def request(self, method, url=None, *, path='', retries=1,
                       connection_timeout=60, **kwargs):
@@ -141,11 +193,13 @@ class BaseSession(metaclass=ABCMeta):
                             domains.
                         auth (child of AuthBase): An object for handling auth
                             construction.
+                        proxy (str): Proxy to be used for sending requests
 
         When you call something like Session.get() or asks.post(), you're
         really calling a partial method that has the 'method' argument
         pre-completed.
         '''
+        proxy = Proxy.parse(kwargs.pop("proxy", None)) or self.proxy
         timeout = kwargs.get('timeout', None)
         req_headers = kwargs.pop('headers', None)
 
@@ -164,7 +218,7 @@ class BaseSession(metaclass=ABCMeta):
             sock = None
             try:
                 sock = await timeout_manager(
-                    connection_timeout, self._grab_connection, url)
+                    connection_timeout, self._grab_connection, url, proxy)
                 port = sock.port
 
                 req_obj = RequestProcessor(
@@ -176,6 +230,7 @@ class BaseSession(metaclass=ABCMeta):
                     encoding=self.encoding,
                     sock=sock,
                     persist_cookies=self._cookie_tracker,
+                    proxy=proxy,
                     **kwargs
                 )
 
@@ -192,7 +247,7 @@ class BaseSession(metaclass=ABCMeta):
 
                 if sock is not None:
                     try:
-                        if r.headers['connection'].lower() == 'close':
+                        if r.headers['connection'].lower() == 'close' and not proxy:
                             sock._active = False
                             await sock.close()
                     except KeyError:
@@ -263,7 +318,7 @@ class BaseSession(metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    async def _grab_connection(self, url):
+    async def _grab_connection(self, url: str, proxy: Proxy):
         """
         A method that will return a socket-like object.
         """
@@ -289,6 +344,7 @@ class Session(BaseSession):
                  base_location=None,
                  endpoint=None,
                  headers=None,
+                 proxy=None,
                  encoding='utf-8',
                  persist_cookies=None,
                  ssl_context=None,
@@ -303,7 +359,7 @@ class Session(BaseSession):
                 host asks will allow its self to have. The default number of
                 connections is 1. You may increase this value as you see fit.
         '''
-        super().__init__(headers, ssl_context)
+        super().__init__(headers, ssl_context, proxy)
         self.encoding = encoding
         self.base_location = base_location
         self.endpoint = endpoint
@@ -314,6 +370,8 @@ class Session(BaseSession):
             self._cookie_tracker = persist_cookies
 
         self._conn_pool = SocketQ()
+        self._http_proxy_conn_pool = SocketQ()
+        self._https_proxy_conn_pool = SocketQ()
 
         self._sema = None
         self._connections = connections
@@ -324,26 +382,43 @@ class Session(BaseSession):
             self._sema = create_semaphore(self._connections)
         return self._sema
 
-    def _checkout_connection(self, host_loc):
+    def _checkout_connection(self, scheme, address, proxy):
+        '''
+        Trying to pull a socket from connection pool, return None if not there.
+
+        Args:
+            scheme (str): http or https
+            netloc (str): netloc, contains port
+            proxy (Proxy): proxy instance to use
+        '''
         try:
-            index = self._conn_pool.index(host_loc)
+            if proxy:
+                if scheme == 'http':
+                    index = self._http_proxy_conn_pool.index(proxy.address)
+                    sock = self._http_proxy_conn_pool.pull(index)
+                else:
+                    index = self._https_proxy_conn_pool.index(address)
+                    sock = self._https_proxy_conn_pool(index)
+            else:
+                index = self._conn_pool.index(address)
+                sock = self._conn_pool(index)
         except ValueError:
             return None
 
-        sock = self._conn_pool.pull(index)
         return sock
 
     async def return_to_pool(self, sock):
-        if sock._active:
+        if not sock._active:
+            return
+
+        if sock.proxy_type == 'http':
+            self._http_proxy_conn_pool.appendleft(sock)
+        elif sock.proxy_type == 'https':
+            self._https_proxy_conn_pool.appendleft(sock)
+        else:
             self._conn_pool.appendleft(sock)
 
-    async def _make_connection(self, host_loc):
-        sock, port = await self._connect(host_loc)
-        sock.host, sock.port = host_loc, port
-
-        return sock
-
-    async def _grab_connection(self, url):
+    async def _grab_connection(self, url: str, proxy: Proxy):
         '''
         The connection pool handler. Returns a connection
         to the caller. If there are no connections ready, and
@@ -357,14 +432,15 @@ class Session(BaseSession):
             url (str): breaks the url down and uses the top level location
                 info to see if we have any connections to the location already
                 lying around.
+            proxy (Proxy): proxy to use in sending requests.
         '''
-        scheme, host, _, _, _, _ = urlparse(url)
-        host_loc = urlunparse((scheme, host, '', '', '', ''))
+        scheme, netloc, _, _, _, _ = urlparse(url)
+        address = get_netloc_port(scheme, netloc)
 
-        sock = self._checkout_connection(host_loc)
+        sock = self._checkout_connection(scheme, address, proxy)
 
         if sock is None:
-            sock = await self._make_connection(host_loc)
+            sock = await self._connect(scheme, address, proxy)
 
         return sock
 

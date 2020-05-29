@@ -72,6 +72,19 @@ HTTP is stateless, and by default asks is too. You can turn stateful cookie retu
     async def main():
         s = Session('https://example.com', persist_cookies=True)
 
+Http(s) Proxy support
+---------------------
+
+You can provide proxy server to use on ``Session`` instanciation. It comes as the same form in ``aiohttp``.::
+
+    from asks import Session
+
+    async def main():
+        s = Session(proxy="http://localhost:3128")
+        s.get('http://httpbin.org')
+
+If you use ``proxy`` keyword argument in a http method call, it will take precedence over session setting.
+
 
 An alternate approach to web APIs
 _________________________________

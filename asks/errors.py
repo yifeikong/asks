@@ -38,3 +38,7 @@ class RequestTimeout(ConnectivityError):
 
 class ServerClosedConnectionError(ConnectivityError):
     pass
+
+
+class ProxyError(ConnectivityError):
+    pass
